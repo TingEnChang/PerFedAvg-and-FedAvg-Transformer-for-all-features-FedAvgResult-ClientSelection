@@ -29,7 +29,7 @@ class SequenceCSVDataset(Dataset):
     - 適合電力需求等時序預測任務
     """
     def __init__(self, csv_path, csv_name, input_len, output_len, features, target, save_path, 
-                 train_ratio=0.8, val_ratio=0.1, split_type='time_based', fit_scalers=True):
+                 train_ratio=0.8, val_ratio=0.1, split_type='time_based', fit_scalers=True,):
         self.csv_path = csv_path          # CSV文件路徑
         self.csv_name = csv_name          # CSV文件名（不含擴展名）
         self.input_len = input_len        # 輸入序列長度（如96個時間步）
@@ -41,7 +41,9 @@ class SequenceCSVDataset(Dataset):
         self.val_ratio = val_ratio        # 驗證集比例（如0.1）
         self.split_type = split_type      # 分割類型（time_based時間順序）
         self.fit_scalers = fit_scalers    # 是否重新擬合標準化器
-        
+
+
+
         # 初始化序列列表
         self.input_seq = []
         self.output_seq = []

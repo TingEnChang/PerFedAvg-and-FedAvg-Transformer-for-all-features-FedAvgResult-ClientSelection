@@ -67,6 +67,37 @@ class Server:
         
         return avg_state_dict
 
+    def select_clients_with_loss_scores(self, m, d):
+        """
+        Client Selection: Power-of-Choice (cpow-d 或 pow-d)
+
+        Args:
+            m: 最終要選擇的客戶端數量
+            d: 候選客戶端數量 (d >= m)
+
+        Returns:
+            selected_clients: 選中的m個客戶端ID列表
+        """
+        # 步驟1：隨機抽取d個候選客戶端
+        candidate_ids = np.random.choice(range(self.args.num_users), d, replace=False)
+
+        # 步驟2：下發全局模型並要求計算損失
+        loss_scores = []
+        for client_id in candidate_ids:
+            client = self.clients[client_id]
+            # 載入全局模型
+            client.model.load_state_dict(self.global_model.state_dict())
+            # 計算損失分數（使用驗證集的小批次）
+            loss_score = client.compute_loss_score()  # 需要在Client.py中實現
+            loss_scores.append((client_id, loss_score))
+
+        # 步驟3：按損失從大到小排序，選擇損失最大的m個
+        loss_scores.sort(key=lambda x: x[1], reverse=True)
+        selected_clients = [client_id for client_id, _ in loss_scores[:m]]
+
+        return selected_clients
+
+
     def run(self):
         """
         執行聯邦學習主循環 - 整個FL系統的核心協調邏輯
@@ -90,12 +121,45 @@ class Server:
             # === 客戶端選擇階段 ===
             # 隨機選擇一部分客戶端參與訓練（典型值：10-100%）
             # 好處：1)減少通信開銷 2)增加隨機性防止過擬合 3)模擬實際部署中的客戶端可用性
-            num_active_clients = int(self.args.r * self.args.num_users)
-            selected_client_ids = np.random.choice(range(self.args.num_users), num_active_clients, replace=False)
-            
+            num_active_clients = int(self.args.r * self.args.num_users)  # m 個最終選擇的客戶端
+
+            # === Client Selection 策略 ===
+            if hasattr(self.args, 'use_client_selection') and self.args.use_client_selection:
+                # 候選集大小 d (約 m 的 2-3 倍)
+                candidate_size = int(self.args.candidate_ratio * self.args.num_users)
+                candidate_size = max(candidate_size, num_active_clients)  # 確保 d >= m
+
+                # 步驟 CS-①：隨機抽取 d 個候選客戶端
+                candidate_ids = np.random.choice(range(self.args.num_users), candidate_size, replace=False)
+
+                print(f"Round {k + 1}/{self.args.K}")
+                print(f"  Candidate pool: {candidate_size} clients, selecting top {num_active_clients} by loss")
+
+                # 步驟 CS-②：獲取損失分數
+                loss_scores = []
+                for i, client_id in enumerate(candidate_ids):
+                    client = self.clients[client_id]
+                    # 下發全局模型
+                    client.model.load_state_dict(self.global_model.state_dict())
+                    # 計算損失分數
+                    use_small_batch = (self.args.selection_method == 'cpow')
+                    loss_score = client.compute_loss_score(use_small_batch=use_small_batch)
+                    loss_scores.append((client_id, loss_score))
+                    print(f"  Candidate {i + 1}/{candidate_size}: Client {client_id + 1}, Loss={loss_score:.6f}")
+
+                # 步驟 CS-③：按損失從大到小排序，選擇 Top-m
+                loss_scores.sort(key=lambda x: x[1], reverse=True)
+                selected_client_ids = [client_id for client_id, _ in loss_scores[:num_active_clients]]
+
+                print(
+                    f"  Selected clients (Top-{num_active_clients} by loss): {[cid + 1 for cid in selected_client_ids]}")
+            else:
+                # 原始隨機選擇（標準 FedAvg）
+                selected_client_ids = np.random.choice(range(self.args.num_users), num_active_clients, replace=False)
+                print(f"Round {k + 1}/{self.args.K}")
+                print(f"  Random selection: {num_active_clients} clients")
+
             local_models = []  # 存儲客戶端訓練後的模型參數
-            
-            print(f"Round {k+1}/{self.args.K}")
             
             # === 並行本地訓練階段 ===
             for i, client_id in enumerate(selected_client_ids):

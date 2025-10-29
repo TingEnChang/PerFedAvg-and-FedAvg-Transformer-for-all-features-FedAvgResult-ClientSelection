@@ -88,7 +88,35 @@ class Client:
         # 載入全局模型狀態
         self.model.load_state_dict(global_state_dict)
         return self._validate()
-    
+
+    def compute_loss_score(self, use_small_batch=True):
+        """
+        計算客戶端在當前全局模型下的損失分數
+        用於 Client Selection (cpow-d 或 pow-d)
+        Args:
+            use_small_batch: True=cpow-d (小批次), False=pow-d (全量)
+
+        Returns:
+            loss_score: 平均損失值（越大表示該客戶端越需要訓練）
+        """
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for inputs, labels in self.val_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
+                total_loss += loss.item()
+                num_batches += 1
+
+                # cpow-d: 只用一個小批次估計
+                if use_small_batch and num_batches >= 1:
+                    break
+
+        return total_loss / num_batches if num_batches > 0 else float('inf')
+
     def evaluate_on_validation_personalized(self, global_state_dict, adaptation_steps=3, support_ratio=0.2):
         """
         Per-FedAvg 個性化驗證評估

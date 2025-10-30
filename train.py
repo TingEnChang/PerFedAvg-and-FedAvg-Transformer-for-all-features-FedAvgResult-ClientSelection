@@ -349,6 +349,9 @@ def main():
     # 設置日誌系統
     setup_logging(config)
     logging.info(f"Starting federated learning with device: {config.device}")
+    logging.info(f"Federal Learning  with clients selection: {config.selection_method}")
+    if config.selection_method == "cpow":
+        logging.info(f"cpow-d num batches for estimate : {config.num_batches_for_estimate}")
     
     # === 步驟3：數據準備階段 ===
     print("Loading client data...")

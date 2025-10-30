@@ -6,7 +6,7 @@ from copy import deepcopy
 class Client:
     """
     聯邦學習客戶端類
-    
+    -
     **支持的算法**：
     1. FedAvg: 標準聯邦平均算法
     2. Per-FedAvg (First-Order): 基於MAML的個性化聯邦學習（一階近似）
@@ -32,39 +32,62 @@ class Client:
         self.args = args                      # 訓練配置參數
         self.criterion = nn.MSELoss()         # 損失函數（回歸任務）
 
-
     def train(self):
         """
         標準 FedAvg 本地訓練
-        
+
         **FedAvg 算法原理**：
         1. 每個客戶端在本地數據上訓練模型多個epoch
         2. 客戶端將訓練後的模型參數發送給服務器
         3. 服務器對所有客戶端的參數進行加權平均
         4. 服務器將平均後的全局模型發送回客戶端
-        
+
         **與個性化方法的對比**：
         - FedAvg: 所有客戶端共享同一個全局模型，無個性化
         - Per-FedAvg: 全局模型作為好的初始化，支持快速個性化適應
-        
+
         **訓練流程**：
         就是標準的監督學習：前向傳播 → 計算損失 → 反向傳播 → 更新參數
+
+        **客戶選擇**
+        rpow-d 需要記錄上一輪的損失量
         """
         self.model.train()
         optimizer = Adam(self.model.parameters(), lr=self.args.beta, weight_decay=1e-4)
-        
+
+        # rpow-d: 只在需要時初始化損失記錄
+        use_rpow = (hasattr(self.args, 'use_client_selection') and
+                    self.args.use_client_selection and
+                    getattr(self.args, 'selection_method', '') == 'rpow')
+
+        if use_rpow:
+            self._training_losses = []
+
         # 本地訓練多個 epoch（與 Per-FedAvg 保持一致以便公平比較）
-        for _ in range(self.args.tau):
+        for epoch in range(self.args.tau):
+            epoch_loss = 0.0 if use_rpow else None  # 只在 rpow 時記錄
+            num_batches = 0 if use_rpow else None
+
             for inputs, labels in self.train_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
-                
+
                 # 標準的深度學習訓練步驟
-                optimizer.zero_grad()           # 清零梯度
-                outputs = self.model(inputs)    # 前向傳播
+                optimizer.zero_grad()  # 清零梯度
+                outputs = self.model(inputs)  # 前向傳播
                 loss = self.criterion(outputs, labels)  # 計算損失
-                loss.backward()                 # 反向傳播計算梯度
-                optimizer.step()                # 更新參數
-        
+                loss.backward()  # 反向傳播計算梯度
+                optimizer.step()  # 更新參數
+
+                # rpow-d: 只在需要時累積損失
+                if use_rpow:
+                    epoch_loss += loss.item()
+                    num_batches += 1
+
+            # rpow-d: 只在需要時記錄每個 epoch 的平均損失
+            if use_rpow:
+                avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+                self._training_losses.append(avg_epoch_loss)
+
         return self.model.state_dict()  # 返回訓練後的參數，供服務器聚合
     
     def _validate(self):
@@ -111,8 +134,10 @@ class Client:
                 total_loss += loss.item()
                 num_batches += 1
 
-                # cpow-d: 只用一個小批次估計
-                if use_small_batch and num_batches >= 1:
+                # cpow-d: 使用num_batches_for_estimate來做批次訓練
+                num_batches_for_estimate = getattr(self.args, 'num_batches_for_estimate', 5)
+                if use_small_batch and num_batches >= num_batches_for_estimate:
+
                     break
 
         return total_loss / num_batches if num_batches > 0 else float('inf')
@@ -196,6 +221,21 @@ class Client:
             total_loss = loss.item()
         
         return total_loss  # 返回個性化適應後的性能
+
+    def get_average_training_loss(self):
+        """
+        獲取本輪訓練的平均損失
+        用於 rpow-d 更新分數緩存
+
+        Returns:
+            avg_loss: 本輪所有 epoch 的平均訓練損失
+        """
+        # 方法1：在訓練過程中累積損失
+        if hasattr(self, '_training_losses') and len(self._training_losses) > 0:
+            return sum(self._training_losses) / len(self._training_losses)
+
+        # 方法2：訓練後在驗證集上計算
+        return self._validate()
     
     def _get_model_config(self):
         """提取TransformerModel構造所需的配置參數"""

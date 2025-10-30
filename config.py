@@ -74,7 +74,16 @@ def load_config(config_path="config.yaml"):
         config.meta_step_size = 0.01
         config.use_second_order = False
         config.hvp_damping = 0.01
-    
+
+    # === Client Selection 配置（新增）===
+    config.use_client_selection = fl_config.get('use_client_selection', False)
+    config.candidate_ratio = fl_config.get('candidate_ratio', 0.3)
+    config.selection_method = fl_config.get('selection_method', 'cpow')
+    config.staleness_threshold = fl_config.get('staleness_threshold', 10)
+    config.num_batches_for_estimate = fl_config.get('num_batches_for_estimate', 5)
+
+    # 模型配置
+    model_config = config_dict['model']
     # 模型配置
     model_config = config_dict['model']
     config.feature_dim = model_config['feature_dim']

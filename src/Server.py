@@ -34,6 +34,17 @@ class Server:
         self.patience_counter = 0           # 當前耐心計數器
         self.early_stop = False             # 早停標誌
 
+        # === rpow-d 專用數據結構（新增） ===
+        self.loss_cache = {}  # 損失分數緩存 {client_id: loss_score}
+        self.last_update_round = {}  # 每個客戶端分數的最後更新輪次 {client_id: round_number}
+        self.staleness_threshold = 10  # 過期閾值（H輪未更新則需刷新）
+
+        # 初始化：所有客戶端設為極大值（冷啟動）
+        for client_id in range(len(clients)):
+            self.loss_cache[client_id] = float('inf')
+            self.last_update_round[client_id] = -1
+
+
     def aggregate_models(self, client_models):
         """
         聯邦平均聚合算法 (FedAvg核心)
@@ -97,11 +108,78 @@ class Server:
 
         return selected_clients
 
+    def select_clients_rpow(self, m, d, current_round):
+        """
+        rpow-d: Rolling Power-of-Choice 客戶端選擇
+
+        特點：
+        1. 使用滾動分數（上一輪平均訓練損失）
+        2. 選客時無需通訊
+        3. 支持冷啟動和過期校準
+
+        Args:
+            m: 最終選擇的客戶端數量
+            d: 候選池大小
+            current_round: 當前輪次
+
+        Returns:
+            selected_clients: 選中的 m 個客戶端ID列表
+        """
+        # === 步驟 CS-①：隨機抽取 d 個候選客戶端 ===
+        candidate_ids = np.random.choice(range(self.args.num_users), d, replace=False)
+
+        print(f"  Candidate pool (rpow-d): {d} clients")
+
+        # === 步驟 CS-②：獲取排序分數（無通訊） ===
+        candidate_scores = []
+        stale_clients = []  # 需要過期校準的客戶端
+
+        for client_id in candidate_ids:
+            # 檢查分數是否過期
+            rounds_since_update = current_round - self.last_update_round[client_id]
+
+            if rounds_since_update > self.staleness_threshold:
+                # 分數過期，需要刷新
+                stale_clients.append(client_id)
+
+            # 使用緩存的損失分數
+            score = self.loss_cache[client_id]
+            candidate_scores.append((client_id, score))
+            print(f"    Client {client_id + 1}: Cached loss={score:.6f}, "
+                  f"Last update: {rounds_since_update} rounds ago")
+
+        # === 過期校準：刷新過期客戶端的分數 ===
+        if stale_clients:
+            print(f"  Refreshing {len(stale_clients)} stale clients...")
+            for client_id in stale_clients:
+                client = self.clients[client_id]
+                # 下發全局模型
+                client.model.load_state_dict(self.global_model.state_dict())
+                # 用小批次計算新的損失分數
+                loss_score = client.compute_loss_score(use_small_batch=True)
+                # 更新緩存
+                self.loss_cache[client_id] = loss_score
+                self.last_update_round[client_id] = current_round
+                # 更新候選分數列表
+                for i, (cid, _) in enumerate(candidate_scores):
+                    if cid == client_id:
+                        candidate_scores[i] = (client_id, loss_score)
+                print(f"    Client {client_id + 1}: Refreshed loss={loss_score:.6f}")
+
+        # === 步驟 CS-③：按分數排序，選擇 Top-m ===
+        # 損失越大越優先（冷啟動的 inf 會被優先選中）
+        candidate_scores.sort(key=lambda x: x[1], reverse=True)
+        selected_clients = [client_id for client_id, _ in candidate_scores[:m]]
+
+        print(f"  Selected clients (Top-{m} by cached loss): {[cid + 1 for cid in selected_clients]}")
+
+        return selected_clients
+
 
     def run(self):
         """
         執行聯邦學習主循環 - 整個FL系統的核心協調邏輯
-        
+
         **聯邦學習訓練流程**：
         1. 客戶端選擇：隨機選擇一部分客戶端參與當前輪次
         2. 模型分發：將當前全局模型發送給選中的客戶端
@@ -109,7 +187,7 @@ class Server:
         4. 模型收集：收集客戶端訓練後的模型參數
         5. 模型聚合：將所有客戶端模型聚合為新的全局模型
         6. 評估與早停：定期評估模型性能，決定是否提前停止
-        
+
         **關鍵設計決策**：
         - 部分客戶端參與：每輪只選擇一部分客戶端，提高效率並增加隨機性
         - 異步訓練：不等待所有客戶端，提高系統容錯性
@@ -117,7 +195,7 @@ class Server:
         """
         for k in range(self.args.K):  # 全局訓練輪數迴圈
             self.global_model.train()
-            
+
             # === 客戶端選擇階段 ===
             # 隨機選擇一部分客戶端參與訓練（典型值：10-100%）
             # 好處：1)減少通信開銷 2)增加隨機性防止過擬合 3)模擬實際部署中的客戶端可用性
@@ -125,34 +203,97 @@ class Server:
 
             # === Client Selection 策略 ===
             if hasattr(self.args, 'use_client_selection') and self.args.use_client_selection:
-                # 候選集大小 d (約 m 的 2-3 倍)
+                # 候選集大小 d (通常是 m 的 2-3 倍)
                 candidate_size = int(self.args.candidate_ratio * self.args.num_users)
                 candidate_size = max(candidate_size, num_active_clients)  # 確保 d >= m
 
-                # 步驟 CS-①：隨機抽取 d 個候選客戶端
-                candidate_ids = np.random.choice(range(self.args.num_users), candidate_size, replace=False)
+                selection_method = getattr(self.args, 'selection_method', 'cpow')
 
                 print(f"Round {k + 1}/{self.args.K}")
-                print(f"  Candidate pool: {candidate_size} clients, selecting top {num_active_clients} by loss")
 
-                # 步驟 CS-②：獲取損失分數
-                loss_scores = []
-                for i, client_id in enumerate(candidate_ids):
-                    client = self.clients[client_id]
-                    # 下發全局模型
-                    client.model.load_state_dict(self.global_model.state_dict())
-                    # 計算損失分數
-                    use_small_batch = (self.args.selection_method == 'cpow')
-                    loss_score = client.compute_loss_score(use_small_batch=use_small_batch)
-                    loss_scores.append((client_id, loss_score))
-                    print(f"  Candidate {i + 1}/{candidate_size}: Client {client_id + 1}, Loss={loss_score:.6f}")
+                # === rpow-d: Rolling Power-of-Choice ===
+                if selection_method == 'rpow':
+                    # 步驟 CS-①：隨機抽取 d 個候選客戶端
+                    candidate_ids = np.random.choice(range(self.args.num_users), candidate_size, replace=False)
 
-                # 步驟 CS-③：按損失從大到小排序，選擇 Top-m
-                loss_scores.sort(key=lambda x: x[1], reverse=True)
-                selected_client_ids = [client_id for client_id, _ in loss_scores[:num_active_clients]]
+                    print(f"  Candidate pool (rpow-d): {candidate_size} clients, selecting top {num_active_clients}")
 
-                print(
-                    f"  Selected clients (Top-{num_active_clients} by loss): {[cid + 1 for cid in selected_client_ids]}")
+                    # 步驟 CS-②：獲取排序分數（無通訊，使用緩存）
+                    candidate_scores = []
+                    stale_clients = []
+
+                    for client_id in candidate_ids:
+                        rounds_since_update = k - self.last_update_round[client_id]
+                        if rounds_since_update > self.staleness_threshold:
+                            stale_clients.append(client_id)
+                        score = self.loss_cache[client_id]
+                        candidate_scores.append((client_id, score))
+
+                        print(f"    Candidate Client {client_id + 1}: Cached loss={score:.6f}, "
+                              f"Last update: {rounds_since_update} rounds ago")
+
+
+                    # 過期校準
+                    if stale_clients:
+                        for client_id in stale_clients:
+                            client = self.clients[client_id]
+                            client.model.load_state_dict(self.global_model.state_dict())
+                            loss_score = client.compute_loss_score(use_small_batch=True)
+                            self.loss_cache[client_id] = loss_score
+                            self.last_update_round[client_id] = k
+
+                            print(f"    Client {client_id + 1}: Refreshed loss={loss_score:.6f}")
+
+                            for i, (cid, _) in enumerate(candidate_scores):
+                                if cid == client_id:
+                                    candidate_scores[i] = (client_id, loss_score)
+
+                    # 步驟 CS-③：選擇 Top-m
+                    candidate_scores.sort(key=lambda x: x[1], reverse=True)
+                    selected_client_ids = [client_id for client_id, _ in candidate_scores[:num_active_clients]]
+
+                    print(
+                        f"  Selected clients (Top-{num_active_clients} by cached loss): {[cid + 1 for cid in selected_client_ids]}")
+
+                    for i, (client_id, loss) in enumerate(candidate_scores[:num_active_clients]):
+                        print(f"    {i + 1}. Client {client_id + 1} (cached loss={loss:.6f})")
+
+                # === pow-d / cpow-d: Power-of-Choice ===
+                elif selection_method in ['pow', 'cpow']:
+                    use_small_batch = (selection_method == 'cpow')
+
+                    # 步驟 CS-①：隨機抽取 d 個候選客戶端
+                    candidate_ids = np.random.choice(range(self.args.num_users), candidate_size, replace=False)
+
+
+
+                    # 步驟 CS-②：獲取損失分數
+                    loss_scores = []
+                    for i, client_id in enumerate(candidate_ids):
+                        client = self.clients[client_id]
+                        client.model.load_state_dict(self.global_model.state_dict())
+                        loss_score = client.compute_loss_score(use_small_batch=use_small_batch)
+                        loss_scores.append((client_id, loss_score))
+                        print(f"  Candidate {i + 1}/{candidate_size}: Client {client_id + 1}, Loss={loss_score:.6f}")
+
+
+
+                    # 步驟 CS-③：選擇 Top-m
+                    loss_scores.sort(key=lambda x: x[1], reverse=True)
+                    selected_client_ids = [client_id for client_id, _ in loss_scores[:num_active_clients]]
+
+                    print(
+                        f"  Selected clients (Top-{num_active_clients} by loss): {[cid + 1 for cid in selected_client_ids]}")
+
+                    for i, (client_id, loss) in enumerate(loss_scores[:num_active_clients]):
+                        print(f"    {i + 1}. Client {client_id + 1} (loss={loss:.6f})")
+
+                else:
+                    # 未知方法，降級到隨機
+                    selected_client_ids = np.random.choice(range(self.args.num_users), num_active_clients,
+                                                           replace=False)
+                    print(f"  Random selection: {num_active_clients} clients")
+
             else:
                 # 原始隨機選擇（標準 FedAvg）
                 selected_client_ids = np.random.choice(range(self.args.num_users), num_active_clients, replace=False)
@@ -160,14 +301,14 @@ class Server:
                 print(f"  Random selection: {num_active_clients} clients")
 
             local_models = []  # 存儲客戶端訓練後的模型參數
-            
+
             # === 並行本地訓練階段 ===
             for i, client_id in enumerate(selected_client_ids):
                 client = self.clients[client_id]
-                
+
                 # 步驟1：將最新的全局模型參數下發給客戶端
                 client.model.load_state_dict(self.global_model.state_dict())
-                
+
                 # 步驟2：根據配置選擇訓練算法
                 if hasattr(self.args, 'algorithm') and self.args.algorithm == 'per_fedavg':
                     # Per-FedAvg 個性化聯邦學習
@@ -180,10 +321,19 @@ class Server:
                 else:
                     # 標準 FedAvg：傳統聯邦學習，無個性化
                     local_model_state = client.train()
-                
+
                 # 步驟3：收集客戶端訓練後的模型參數
                 local_models.append(local_model_state)
-                print(f"  Client {client_id+1} training completed ({i+1}/{len(selected_client_ids)})")
+                print(f"  Client {client_id + 1} training completed ({i + 1}/{len(selected_client_ids)})")
+
+                # === rpow-d 專用：更新分數緩存 ===
+                if hasattr(self.args, 'use_client_selection') and self.args.use_client_selection \
+                        and getattr(self.args, 'selection_method', '') == 'rpow':
+                    avg_training_loss = client.get_average_training_loss()
+                    self.loss_cache[client_id] = avg_training_loss
+                    self.last_update_round[client_id] = k
+
+                    print(f"    → rpow cache updated: Client {client_id + 1}, loss={avg_training_loss:.6f}")
 
             # === 模型聚合階段 ===
             # 將所有客戶端的模型參數聚合為新的全局模型
@@ -194,28 +344,28 @@ class Server:
             if (k + 1) % self.args.eval_interval == 0:
                 # 在驗證集上評估當前全局模型的性能
                 avg_val_loss = self.evaluate()
-                
+
                 # 早停邏輯：如果驗證損失有顯著改善，更新最佳模型
                 if avg_val_loss < self.best_val_loss - self.args.early_stopping_min_delta:
                     self.best_val_loss = avg_val_loss
                     self.patience_counter = 0
-                    
+
                     # 保存當前最佳模型，用於最終部署
-                    torch.save(self.global_model.state_dict(), 
-                              os.path.join(self.args.model_save_path, "best_global_model.pth"))
+                    torch.save(self.global_model.state_dict(),
+                               os.path.join(self.args.model_save_path, "best_global_model.pth"))
                 else:
                     # 驗證損失沒有改善，增加耐心計數器
                     self.patience_counter += 1
                     if self.patience_counter >= self.args.early_stopping_patience:
-                        print(f"Early stopping triggered at round {k+1}")
+                        print(f"Early stopping triggered at round {k + 1}")
                         self.early_stop = True
                         break  # 提前結束訓練
-                
+
                 print(f"Early stop counter: {self.patience_counter}/{self.args.early_stopping_patience}")
-            
+
             if self.early_stop:
                 break
-        
+
         # === 訓練完成後的最佳模型載入 ===
         best_model_path = os.path.join(self.args.model_save_path, "best_global_model.pth")
         if os.path.exists(best_model_path):
